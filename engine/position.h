@@ -135,7 +135,7 @@ public:
     void flip();
     std::string to_string() const;
     
-private:
+public:
     // Internal helpers
     void set_castling_right(Color c, Square rfrom);
     void set_check_info(StateInfo* si) const;

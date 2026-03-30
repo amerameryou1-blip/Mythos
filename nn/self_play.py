@@ -145,7 +145,7 @@ class UCIEngine:
         return None
 
 
-def play_game(engine: UCIEngine, depth: int = 6, max_moves: int = 300, 
+def play_game(engine: UCIEngine, depth: int = 5, max_moves: int = 120,
               add_noise: bool = True) -> List[GamePosition]:
     """
     Play a single game and collect positions.

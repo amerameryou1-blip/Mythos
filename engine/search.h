@@ -37,10 +37,12 @@ public:
     
     TTEntry* probe(Key key, bool& found) const;
     int hashfull() const;
+    uint8_t current_generation() const { return generation; }
     
 private:
     TTEntry* table;
     size_t clusterCount;
+    size_t clusterMask;
     uint8_t generation;
 };
 

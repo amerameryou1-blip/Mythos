@@ -22,7 +22,7 @@ int LMRTable[MAX_PLY][MAX_MOVES];
 void init_lmr() {
     for (int d = 1; d < MAX_PLY; d++) {
         for (int m = 1; m < MAX_MOVES; m++) {
-            LMRTable[d][m] = int(0.75 + std::log(d) * std::log(m) / 2.25);
+            LMRTable[d][m] = int(1.10 + std::log(d) * std::log(m) / 1.85);
         }
     }
 }
@@ -38,8 +38,8 @@ constexpr int SCORE_KILLER1     = 6000000;
 constexpr int SCORE_KILLER2     = 5000000;
 constexpr int SCORE_COUNTER     = 4000000;
 
-// Futility margins
-constexpr int FutilityMargin[4] = { 0, 200, 300, 500 };
+// Futility margins (more aggressive for faster self-play)
+constexpr int FutilityMargin[4] = { 0, 300, 500, 800 };
 
 // Razoring margin
 constexpr int RazoringMargin = 400;
@@ -82,7 +82,7 @@ Value TTEntry::value(int ply) const {
     return Value(score);
 }
 
-TranspositionTable::TranspositionTable(size_t mbSize) : table(nullptr), clusterCount(0), generation(0) {
+TranspositionTable::TranspositionTable(size_t mbSize) : table(nullptr), clusterCount(0), clusterMask(0), generation(0) {
     resize(mbSize);
 }
 
@@ -92,10 +92,16 @@ TranspositionTable::~TranspositionTable() {
 
 void TranspositionTable::resize(size_t mbSize) {
     delete[] table;
-    
-    clusterCount = mbSize * 1024 * 1024 / sizeof(TTEntry);
-    clusterCount = std::max(clusterCount, size_t(1024));
-    
+
+    size_t requested = mbSize * 1024 * 1024 / sizeof(TTEntry);
+    requested = std::max(requested, size_t(1024));
+
+    clusterCount = 1;
+    while ((clusterCount << 1) <= requested) {
+        clusterCount <<= 1;
+    }
+    clusterMask = clusterCount - 1;
+
     table = new TTEntry[clusterCount]();
     clear();
 }
@@ -110,14 +116,15 @@ void TranspositionTable::new_search() {
 }
 
 TTEntry* TranspositionTable::probe(Key key, bool& found) const {
-    TTEntry* entry = &table[key % clusterCount];
+    TTEntry* entry = &table[key & clusterMask];
     found = (entry->key == key);
     return entry;
 }
 
 int TranspositionTable::hashfull() const {
     int count = 0;
-    for (size_t i = 0; i < std::min(clusterCount, size_t(1000)); i++) {
+    const size_t sample = std::min(clusterCount, size_t(1000));
+    for (size_t i = 0; i < sample; i++) {
         if (table[i].generation == generation && table[i].key != 0) {
             count++;
         }
@@ -219,12 +226,17 @@ void Search::allocate_time(Color us) {
 }
 
 void Search::check_time() {
+    if (limits.nodes > 0 && nodes >= limits.nodes) {
+        stopped.store(true, std::memory_order_relaxed);
+        return;
+    }
+
     if (limits.infinite) return;
-    
-    if ((nodes & 2047) == 0) {
+
+    if ((nodes & 1023) == 0) {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
-        
+
         if (elapsed >= maxTime) {
             stopped.store(true, std::memory_order_relaxed);
         }
@@ -365,36 +377,37 @@ void Search::iterative_deepening(Position& pos) {
             }
         }
         
-        // Print info
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
-        int64_t nps = elapsed > 0 ? nodes * 1000 / elapsed : nodes;
-        
-        std::cout << "info depth " << depth
-                  << " seldepth " << selDepth
-                  << " score ";
-        
-        if (score >= VALUE_MATE_IN_MAX_PLY) {
-            std::cout << "mate " << (VALUE_MATE - score + 1) / 2;
-        } else if (score <= VALUE_MATED_IN_MAX_PLY) {
-            std::cout << "mate " << -(VALUE_MATE + score) / 2;
-        } else {
-            std::cout << "cp " << score;
+
+        if (depth <= 3 || elapsed >= allocatedTime / 4 || limits.movetime > 0 || !limits.searchmoves.empty()) {
+            int64_t nps = elapsed > 0 ? nodes * 1000 / elapsed : nodes;
+
+            std::cout << "info depth " << depth
+                      << " seldepth " << selDepth
+                      << " score ";
+
+            if (score >= VALUE_MATE_IN_MAX_PLY) {
+                std::cout << "mate " << (VALUE_MATE - score + 1) / 2;
+            } else if (score <= VALUE_MATED_IN_MAX_PLY) {
+                std::cout << "mate " << -(VALUE_MATE + score) / 2;
+            } else {
+                std::cout << "cp " << score;
+            }
+
+            std::cout << " nodes " << nodes
+                      << " nps " << nps
+                      << " time " << elapsed
+                      << " hashfull " << TT.hashfull()
+                      << " pv";
+
+            for (int i = 0; i < pvLength[0]; i++) {
+                std::cout << " " << pvTable[0][i].to_uci();
+            }
+            std::cout << std::endl;
         }
-        
-        std::cout << " nodes " << nodes
-                  << " nps " << nps
-                  << " time " << elapsed
-                  << " hashfull " << TT.hashfull()
-                  << " pv";
-        
-        for (int i = 0; i < pvLength[0]; i++) {
-            std::cout << " " << pvTable[0][i].to_uci();
-        }
-        std::cout << std::endl;
-        
-        // Check if we should stop due to time
-        if (elapsed >= allocatedTime && !limits.infinite) {
+
+        if ((limits.nodes > 0 && nodes >= limits.nodes) || (elapsed >= allocatedTime && !limits.infinite)) {
             break;
         }
     }
@@ -522,18 +535,19 @@ Value Search::search(Position& pos, Value alpha, Value beta, int depth, int ply,
     
     // Score moves
     score_moves(pos, moves, ttMove, ply);
-    
+
+    bool restrictRootMoves = (ply == 0 && !limits.searchmoves.empty());
+
     Move bestMoveLocal = MOVE_NONE;
     Value bestValue = -VALUE_INFINITE;
     int moveCount = 0;
     Value origAlpha = alpha;
-    
+
     for (int i = 0; i < moves.size(); i++) {
         pick_move(moves, i);
         Move m = moves[i].move;
-        
-        // Skip non-TT moves at root if searchmoves specified
-        if (ply == 0 && !limits.searchmoves.empty()) {
+
+        if (restrictRootMoves) {
             bool found = false;
             for (Move sm : limits.searchmoves) {
                 if (sm == m) { found = true; break; }
@@ -547,14 +561,14 @@ Value Search::search(Position& pos, Value alpha, Value beta, int depth, int ply,
         bool isQuiet = !isCapture && m.type() != PROMOTION;
         bool givesCheck = pos.gives_check(m);
         
-        // Late move pruning
-        if (!inCheck && isQuiet && depth <= 3 && moveCount > (improving ? 6 : 3) + depth * 3) {
+        // Late move pruning (more aggressive for self-play throughput)
+        if (!inCheck && isQuiet && depth <= 4 && moveCount > (improving ? 5 : 2) + depth * 2) {
             continue;
         }
-        
+
         // Futility pruning for quiet moves
-        if (!inCheck && isQuiet && depth <= 6 && moveCount > 1 &&
-            eval + FutilityMargin[std::min(depth, 3)] + 200 * depth <= alpha) {
+        if (!inCheck && isQuiet && depth <= 7 && moveCount > 1 &&
+            eval + FutilityMargin[std::min(depth, 3)] + 260 * depth <= alpha) {
             continue;
         }
         
@@ -572,16 +586,19 @@ Value Search::search(Position& pos, Value alpha, Value beta, int depth, int ply,
         // Late Move Reductions
         if (depth >= 3 && moveCount > 1 && isQuiet) {
             int R = LMRTable[std::min(depth, MAX_PLY - 1)][std::min(moveCount, MAX_MOVES - 1)];
-            
+
             // Reduce less for killers
             if (m == killers[ply][0] || m == killers[ply][1]) R--;
-            
+
             // Reduce more if not improving
-            if (!improving) R++;
-            
+            if (!improving) R += 1;
+
             // Reduce more for cut nodes
-            if (cutNode) R++;
-            
+            if (cutNode) R += 1;
+
+            // Extra reduction for very late quiets
+            if (moveCount > 8 && depth >= 4) R += 1;
+
             R = std::max(0, std::min(R, newDepth - 1));
             
             // Reduced depth search
